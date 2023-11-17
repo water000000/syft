@@ -25,7 +25,6 @@ func ToFormatModel(s sbom.SBOM) *cyclonedx.BOM {
 	// "pattern": "^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 	cdxBOM.SerialNumber = uuid.New().URN()
 	cdxBOM.Metadata = toBomDescriptor(s.Descriptor.Name, s.Descriptor.Version, s.Source)
-
 	packages := s.Artifacts.Packages.Sorted()
 	components := make([]cyclonedx.Component, len(packages))
 	for i, p := range packages {
@@ -35,10 +34,12 @@ func ToFormatModel(s sbom.SBOM) *cyclonedx.BOM {
 	cdxBOM.Components = &components
 
 	dependencies := toDependencies(s.Relationships)
+	if dependencies != nil && len(dependencies) > 0 && cdxBOM != nil && cdxBOM.Metadata != nil && cdxBOM.Metadata.Component != nil && len(cdxBOM.Metadata.Component.BOMRef) > 0 {
+		dependencies[0].Ref = cdxBOM.Metadata.Component.BOMRef
+	}
 	if len(dependencies) > 0 {
 		cdxBOM.Dependencies = &dependencies
 	}
-
 	return cdxBOM
 }
 
@@ -121,8 +122,7 @@ func toBomDescriptor(name, version string, srcMetadata source.Description) *cycl
 				Version: version,
 			},
 		},
-		Properties: toBomProperties(srcMetadata),
-		Component:  toBomDescriptorComponent(srcMetadata),
+		Component: toBomDescriptorComponent(srcMetadata),
 	}
 }
 
@@ -134,6 +134,8 @@ func toBomDescriptor(name, version string, srcMetadata source.Description) *cycl
 func isExpressiblePackageRelationship(ty artifact.RelationshipType) bool {
 	switch ty {
 	case artifact.DependencyOfRelationship:
+		return true
+	case artifact.ContainsRelationship:
 		return true
 	default:
 		return false
@@ -148,36 +150,57 @@ func toDependencies(relationships []artifact.Relationship) []cyclonedx.Dependenc
 			log.Debugf("unable to convert relationship type to CycloneDX JSON, dropping: %#v", r)
 			continue
 		}
+		if r.Type == artifact.ContainsRelationship {
+			fromref := string(r.From.ID())
 
-		// we only capture package-to-package relationships for now
-		fromPkg, ok := r.From.(pkg.Package)
-		if !ok {
-			log.Tracef("unable to convert relationship fromPkg to CycloneDX JSON, dropping: %#v", r)
-			continue
-		}
-
-		toPkg, ok := r.To.(pkg.Package)
-		if !ok {
-			log.Tracef("unable to convert relationship toPkg to CycloneDX JSON, dropping: %#v", r)
-			continue
-		}
-
-		toRef := deriveBomRef(toPkg)
-		dep := dependencies[toRef]
-		if dep == nil {
-			dep = &cyclonedx.Dependency{
-				Ref:          toRef,
-				Dependencies: &[]string{},
+			toPkg, ok := r.To.(pkg.Package)
+			if !ok {
+				log.Tracef("unable to convert relationship toPkg to CycloneDX JSON, dropping: %#v", r)
+				continue
 			}
-			dependencies[toRef] = dep
-		}
 
-		fromRef := deriveBomRef(fromPkg)
-		if !slices.Contains(*dep.Dependencies, fromRef) {
-			*dep.Dependencies = append(*dep.Dependencies, fromRef)
+			toRef := deriveBomRef(toPkg)
+			dep := dependencies[fromref]
+			if dep == nil {
+				dep = &cyclonedx.Dependency{
+					Ref:          fromref,
+					Dependencies: &[]string{},
+				}
+				dependencies[fromref] = dep
+			}
+
+			if !slices.Contains(*dep.Dependencies, toRef) {
+				*dep.Dependencies = append(*dep.Dependencies, toRef)
+			}
+		} else {
+			fromPkg, ok := r.From.(pkg.Package)
+			if !ok {
+				log.Tracef("unable to convert relationship fromPkg to CycloneDX JSON, dropping: %#v", r)
+				continue
+			}
+
+			toPkg, ok := r.To.(pkg.Package)
+			if !ok {
+				log.Tracef("unable to convert relationship toPkg to CycloneDX JSON, dropping: %#v", r)
+				continue
+			}
+
+			toRef := deriveBomRef(toPkg)
+			dep := dependencies[toRef]
+			if dep == nil {
+				dep = &cyclonedx.Dependency{
+					Ref:          toRef,
+					Dependencies: &[]string{},
+				}
+				dependencies[toRef] = dep
+			}
+
+			fromRef := deriveBomRef(fromPkg)
+			if !slices.Contains(*dep.Dependencies, fromRef) {
+				*dep.Dependencies = append(*dep.Dependencies, fromRef)
+			}
 		}
 	}
-
 	result := make([]cyclonedx.Dependency, 0, len(dependencies))
 	for _, dep := range dependencies {
 		slices.Sort(*dep.Dependencies)
@@ -187,17 +210,7 @@ func toDependencies(relationships []artifact.Relationship) []cyclonedx.Dependenc
 	slices.SortFunc(result, func(a, b cyclonedx.Dependency) int {
 		return strings.Compare(a.Ref, b.Ref)
 	})
-
 	return result
-}
-
-func toBomProperties(srcMetadata source.Description) *[]cyclonedx.Property {
-	metadata, ok := srcMetadata.Metadata.(source.StereoscopeImageSourceMetadata)
-	if ok {
-		props := encodeProperties(metadata.Labels, "syft:image:labels")
-		return &props
-	}
-	return nil
 }
 
 func toBomDescriptorComponent(srcMetadata source.Description) *cyclonedx.Component {
